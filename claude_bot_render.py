@@ -21,6 +21,23 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Jarvis OK")
+
+    def do_POST(self):
+        if self.path == "/webhook":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body   = self.rfile.read(length)
+                upd    = json.loads(body)
+                threading.Thread(target=_dispatch_update, args=(upd,), daemon=True).start()
+            except Exception as e:
+                print(f"[WEBHOOK ERR] {e}", flush=True)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def log_message(self, *args): pass
 
 def _start_health_server():
@@ -43,6 +60,7 @@ MAX_LOOPS   = 12
 MEMORY_DIR = os.path.join(PROJECT_DIR, "memory")
 BOT_START  = datetime.now()
 TOPIC_NAMES = {}
+_hists = {}
 
 os.makedirs(TMP_DIR, exist_ok=True)
 os.makedirs(MEMORY_DIR, exist_ok=True)
@@ -1225,6 +1243,70 @@ def _schedule_session_log(hists_ref, interval=600):
     threading.Thread(target=_loop, daemon=True).start()
 
 
+# ── Обработка одного апдейта (webhook + polling общий путь) ──────────────────
+def _dispatch_update(upd):
+    global _hists
+    msg     = upd.get("message", {})
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+
+    if is_master_message(msg):
+        handle_master(msg)
+        return
+
+    allowed = {CHAT_ID}
+    if GROUP_ID:
+        allowed.add(GROUP_ID)
+    if chat_id not in allowed:
+        print(f"[SKIP] chat_id={chat_id}", flush=True)
+        return
+
+    if msg.get("forum_topic_created") and chat_id == GROUP_ID:
+        on_new_topic(msg)
+        return
+
+    text       = msg.get("text", "").strip()
+    thread_id  = msg.get("message_thread_id")
+    media_type = (
+        "голос"    if msg.get("voice") or msg.get("audio") else
+        "фото"     if msg.get("photo") else
+        "документ" if msg.get("document") else
+        "видео"    if msg.get("video") or msg.get("video_note") else
+        "стикер"   if msg.get("sticker") else
+        "текст"
+    )
+    topic_label = TOPIC_NAMES.get(thread_id, f"thread={thread_id}") if thread_id else "личный"
+    print(f"[MSG] {datetime.now():%H:%M:%S} [{media_type}] [{topic_label}] {text[:80]}", flush=True)
+
+    def _handle(msg=msg, chat_id=chat_id, thread_id=thread_id,
+                reply_id=msg.get("message_id"), text=text):
+        _set_ctx(chat_id, thread_id, reply_id)
+        try:
+            hist_key = thread_id if thread_id else "personal"
+            with _hist_lock:
+                if hist_key not in _hists:
+                    _hists[hist_key] = load_hist(thread_id)
+                hist = _hists[hist_key]
+
+            if thread_id and thread_id not in TOPIC_NAMES:
+                ensure_topic_context(thread_id, chat_id)
+
+            if text.startswith("/"):
+                result = cmd(text, hist)
+                if result is not None:
+                    with _hist_lock:
+                        _hists[hist_key] = result
+            else:
+                process(msg, hist)
+        except Exception as e:
+            print(f"[MSG ERR] {e}", flush=True)
+            import traceback; traceback.print_exc()
+            send(f"Что-то пошло не так: {e}")
+        finally:
+            _clear_ctx()
+
+    threading.Thread(target=_handle, daemon=True).start()
+
+
 # ── Запуск ────────────────────────────────────────────────────────────────────
 def main():
     global TOPIC_NAMES
@@ -1244,104 +1326,23 @@ def main():
         "_Просто пиши естественным языком_ 🥷🏻"
     )
 
-    hists        = {}
-    offset       = None
-    poll_count   = 0
-    net_failures = 0
+    _schedule_session_log(_hists)
 
-    _schedule_session_log(hists)
+    # Регистрируем webhook — Telegram будет пушить апдейты на наш URL
+    webhook_url = f"https://jarvis-bot-tip7.onrender.com/webhook"
+    r = tg("setWebhook", {"url": webhook_url, "drop_pending_updates": True})
+    if r.get("ok"):
+        print(f"[WEBHOOK] Зарегистрирован: {webhook_url}", flush=True)
+    else:
+        print(f"[WEBHOOK ERR] {r}", flush=True)
 
-    while True:
-        try:
-            upds = get_updates(offset)
-            poll_count += 1
-
-            if poll_count % 20 == 0:
-                print(f"[ALIVE] polls={poll_count} {datetime.now():%H:%M:%S}", flush=True)
-
-            if not upds.get("ok"):
-                net_failures += 1
-                print(f"[TG WARN] failures={net_failures} {upds}", flush=True)
-                time.sleep(min(3 * net_failures, 60))
-                continue
-
-            if net_failures > 0:
-                print(f"[NET] Восстановлено после {net_failures} ошибок", flush=True)
-                net_failures = 0
-
-            results = upds.get("result", [])
-            if results:
-                print(f"[POLL] {len(results)} updates", flush=True)
-
-            for upd in results:
-                offset  = upd["update_id"] + 1
-                msg     = upd.get("message", {})
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-
-                if is_master_message(msg):
-                    handle_master(msg)
-                    continue
-
-                allowed = {CHAT_ID}
-                if GROUP_ID:
-                    allowed.add(GROUP_ID)
-                if chat_id not in allowed:
-                    print(f"[SKIP] chat_id={chat_id}", flush=True)
-                    continue
-
-                if msg.get("forum_topic_created") and chat_id == GROUP_ID:
-                    on_new_topic(msg)
-                    continue
-
-                text      = msg.get("text", "").strip()
-                thread_id = msg.get("message_thread_id")
-                media_type = (
-                    "голос"    if msg.get("voice") or msg.get("audio") else
-                    "фото"     if msg.get("photo") else
-                    "документ" if msg.get("document") else
-                    "видео"    if msg.get("video") or msg.get("video_note") else
-                    "стикер"   if msg.get("sticker") else
-                    "текст"
-                )
-                topic_label = TOPIC_NAMES.get(thread_id, f"thread={thread_id}") if thread_id else "личный"
-                print(f"[MSG] {datetime.now():%H:%M:%S} [{media_type}] [{topic_label}] {text[:80]}", flush=True)
-
-                def _handle(msg=msg, chat_id=chat_id, thread_id=thread_id,
-                            reply_id=msg.get("message_id"), text=text, hists=hists):
-                    _set_ctx(chat_id, thread_id, reply_id)
-                    try:
-                        hist_key = thread_id if thread_id else "personal"
-                        with _hist_lock:
-                            if hist_key not in hists:
-                                hists[hist_key] = load_hist(thread_id)
-                            hist = hists[hist_key]
-
-                        if thread_id and thread_id not in TOPIC_NAMES:
-                            ensure_topic_context(thread_id, chat_id)
-
-                        if text.startswith("/"):
-                            result = cmd(text, hist)
-                            if result is not None:
-                                with _hist_lock:
-                                    hists[hist_key] = result
-                        else:
-                            process(msg, hist)
-                    except Exception as e:
-                        print(f"[MSG ERR] {e}", flush=True)
-                        import traceback; traceback.print_exc()
-                        send(f"Что-то пошло не так: {e}")
-                    finally:
-                        _clear_ctx()
-
-                threading.Thread(target=_handle, daemon=True).start()
-
-        except KeyboardInterrupt:
-            print("[BOT] Остановлен.", flush=True)
-            break
-        except Exception as e:
-            print(f"[LOOP ERR] {e}", flush=True)
-            import traceback; traceback.print_exc()
-            time.sleep(5)
+    # Держим процесс живым — апдейты приходят через do_POST
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("[BOT] Остановлен.", flush=True)
+        tg("deleteWebhook", {})
 
 
 if __name__ == "__main__":
