@@ -454,9 +454,19 @@ def build_system():
     if _system_cache["text"] and _system_cache["mtime"] == cache_key:
         return _system_cache["text"]
 
-    try:
-        claude_md = open(os.path.join(PROJECT_DIR, "CLAUDE.md"), encoding="utf-8").read()
-    except Exception:
+    # Ищем CLAUDE.md: сначала рядом со скриптом (в репо), потом в PROJECT_DIR
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    for _claude_path in [
+        os.path.join(_script_dir, "CLAUDE.md"),
+        os.path.join(PROJECT_DIR, "CLAUDE.md"),
+    ]:
+        if os.path.exists(_claude_path):
+            try:
+                claude_md = open(_claude_path, encoding="utf-8").read()
+                break
+            except Exception:
+                pass
+    else:
         claude_md = "(CLAUDE.md не найден)"
 
     parts = []
