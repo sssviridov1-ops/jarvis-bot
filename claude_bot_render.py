@@ -53,8 +53,8 @@ except Exception:
     def is_master_message(msg): return False
     def handle_master(msg): return False
 
-MAX_TOKENS  = 8000
-MAX_HISTORY = 30
+MAX_TOKENS  = 2000
+MAX_HISTORY = 15
 MAX_LOOPS   = 12
 
 MEMORY_DIR = os.path.join(PROJECT_DIR, "memory")
@@ -468,6 +468,10 @@ def build_system():
                 pass
     else:
         claude_md = "(CLAUDE.md не найден)"
+
+    # Groq free tier: 12k TPM. Обрезаем CLAUDE.md чтобы не превысить
+    if len(claude_md) > 4000:
+        claude_md = claude_md[:4000] + "\n...(обрезано для лимита токенов)"
 
     parts = []
     idx = os.path.join(MEMORY_DIR, "MEMORY.md")
